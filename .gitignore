@@ -1,0 +1,13 @@
+build/
+*.o
+*.so
+*.so.*
+debug.log
+saved_credentials.json
+__pycache__/
+*.pyc
+LiveView*.JPG
+*.zip
+*.pdf
+SourceCodeOfOpenSourceSoftware/
+RemoteCli/external/

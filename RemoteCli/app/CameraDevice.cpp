@@ -537,10 +537,10 @@ void CameraDevice::live_view_stream(int target_fps)
     SDK::SetDeviceSetting(m_device_handle, SDK::Setting_Key_EnableLiveView, 1);
     std::this_thread::sleep_for(500ms);
 
-    // Set live view quality to Low for faster streaming
+    // Set live view quality to High for best virtual camera output
     SDK::CrDeviceProperty quality;
     quality.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_LiveView_Image_Quality);
-    quality.SetCurrentValue(SDK::CrPropertyLiveViewImageQuality_Low);
+    quality.SetCurrentValue(SDK::CrPropertyLiveViewImageQuality_High);
     quality.SetValueType(SDK::CrDataType::CrDataType_UInt16);
     SDK::SetDeviceProperty(m_device_handle, &quality);
 

@@ -4,7 +4,7 @@
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, GLib, GdkPixbuf
+from gi.repository import Gtk, Adw, GLib, Gio, GdkPixbuf
 import subprocess
 import threading
 import os
@@ -18,6 +18,7 @@ LIVEVIEW_PATH = os.path.join(SDK_DIR, "LiveView000000.JPG")
 LOG_FILE = os.path.join(APP_DIR, "debug.log")
 CREDS_FILE = os.path.join(APP_DIR, "saved_credentials.json")
 CAMERA_IMAGES_DIR = os.path.join(APP_DIR, "camera_images")
+VCAM_DEVICE = "/dev/video10"
 
 # ILCE model code → friendly name
 SONY_MODEL_NAMES = {
@@ -81,6 +82,84 @@ def delete_creds(camera_id):
 def debug(msg):
     with open(LOG_FILE, "a") as f:
         f.write(msg + "\n")
+
+
+class VirtualCamera:
+    """Feeds live view JPEG frames to a v4l2loopback virtual camera via ffmpeg."""
+
+    def __init__(self):
+        self.proc = None
+        self._active = False
+        self._thread = None
+
+    def start(self):
+        if not os.path.exists(VCAM_DEVICE):
+            debug(f"[vcam] Device {VCAM_DEVICE} not found")
+            return False
+        self._active = True
+        self._thread = threading.Thread(target=self._feed_loop, daemon=True)
+        self._thread.start()
+        debug("[vcam] Started")
+        return True
+
+    def stop(self):
+        self._active = False
+        if self.proc:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            self.proc = None
+        debug("[vcam] Stopped")
+
+    def _feed_loop(self):
+        """Feed live view to v4l2loopback via long-running ffmpeg with image updates."""
+        import time
+        import shutil
+
+        # Create a staging file to avoid reading partial writes
+        stage_path = LIVEVIEW_PATH + ".vcam"
+
+        while self._active:
+            if not os.path.exists(LIVEVIEW_PATH) or os.path.getsize(LIVEVIEW_PATH) < 100:
+                time.sleep(0.1)
+                continue
+
+            debug("[vcam] Starting ffmpeg (long-running)")
+            # Use -re for real-time, -loop 1 to keep re-reading the file
+            # -f image2 -loop 1 continuously re-reads the same file
+            try:
+                self.proc = subprocess.Popen([
+                    "ffmpeg", "-y",
+                    "-re",
+                    "-loop", "1",
+                    "-f", "image2",
+                    "-framerate", "30",
+                    "-i", LIVEVIEW_PATH,
+                    "-pix_fmt", "yuyv422",
+                    "-f", "v4l2",
+                    VCAM_DEVICE,
+                ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # Keep running until stopped or process dies
+                while self._active and self.proc.poll() is None:
+                    time.sleep(0.5)
+
+            except Exception as e:
+                debug(f"[vcam] Error: {e}")
+                time.sleep(1)
+
+            if self.proc:
+                try:
+                    self.proc.kill()
+                    self.proc.wait()
+                except Exception:
+                    pass
+                self.proc = None
+
+    @property
+    def is_active(self):
+        return self._active
 
 
 class CameraProcess:
@@ -163,6 +242,7 @@ class SonyRemoteApp(Adw.Application):
         self._tracking_frames = []
         self._face_frames = []
         self._lv_size_set = False
+        self.vcam = VirtualCamera()
 
     def do_activate(self):
         css = Gtk.CssProvider()
@@ -209,6 +289,10 @@ class SonyRemoteApp(Adw.Application):
         toolbar.set_content(self.stack)
 
         self.win.set_content(toolbar)
+
+        # Close button hides window when vcam is active (minimize to background)
+        self.win.connect("close-request", self._on_close_request)
+
         self.win.present()
 
         # Show saved cameras, auto-connect if configured, otherwise auto-scan
@@ -535,10 +619,15 @@ class SonyRemoteApp(Adw.Application):
         lv_click.connect("released", self._on_lv_click)
         page.add_controller(lv_click)
 
-        # ── Top right: small HUD buttons ──
-        top_right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4,
-                            margin_end=12, margin_top=8,
-                            halign=Gtk.Align.END, valign=Gtk.Align.START)
+        # ── Top bar: draggable + HUD buttons ──
+        top_handle = Gtk.WindowHandle(valign=Gtk.Align.START)
+        top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4,
+                          margin_start=12, margin_end=12, margin_top=8)
+
+        # Spacer to push buttons right (but whole bar is draggable)
+        top_bar.append(Gtk.Box(hexpand=True))
+
+        top_right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         top_right.add_css_class("lv-hud")
 
         self.overlay_toggle = Gtk.ToggleButton(icon_name="view-reveal-symbolic",
@@ -547,13 +636,21 @@ class SonyRemoteApp(Adw.Application):
         self.overlay_toggle.connect("toggled", lambda b: self.focus_draw.queue_draw())
         top_right.append(self.overlay_toggle)
 
+        self.vcam_toggle = Gtk.ToggleButton(icon_name="camera-web-symbolic",
+                                             active=False, tooltip_text="Virtual webcam",
+                                             css_classes=["flat", "circular"])
+        self.vcam_toggle.connect("toggled", self._on_vcam_toggled)
+        top_right.append(self.vcam_toggle)
+
         disconnect_btn = Gtk.Button(icon_name="process-stop-symbolic",
                                      tooltip_text="Disconnect",
                                      css_classes=["flat", "circular", "destructive-action"])
         disconnect_btn.connect("clicked", self.on_disconnect)
         top_right.append(disconnect_btn)
 
-        page.add_overlay(top_right)
+        top_bar.append(top_right)
+        top_handle.set_child(top_bar)
+        page.add_overlay(top_handle)
 
         # ── Bottom overlay ──
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
@@ -1040,11 +1137,19 @@ class SonyRemoteApp(Adw.Application):
         except Exception as e:
             debug(f"[lv] Error: {e}")
 
+    def _on_vcam_toggled(self, btn):
+        if btn.get_active():
+            if not self.vcam.start():
+                btn.set_active(False)
+        else:
+            self.vcam.stop()
+
     def _stop_live_view(self):
         self._lv_active = False
         if self._lv_streaming and self.cam:
             self.cam.send("stop")
         self._lv_streaming = False
+        self.vcam.stop()
 
     # ── Disconnect ──
 
@@ -1092,7 +1197,39 @@ class SonyRemoteApp(Adw.Application):
         self.cameras = []
         self._show_saved_cameras()
 
+    def _on_close_request(self, window):
+        """If virtual camera is active, hide window instead of quitting."""
+        if self.vcam.is_active:
+            window.set_visible(False)
+            # Send notification so user knows it's still running
+            notif = Gio.Notification.new("Sony Remote")
+            notif.set_body("Virtual camera is still active. Click to reopen.")
+            notif.set_default_action("app.show")
+            self.send_notification("vcam-running", notif)
+            return True  # prevent default close
+        return False  # allow normal close
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        # Action to re-show window from notification
+        show_action = Gio.SimpleAction.new("show", None)
+        show_action.connect("activate", lambda a, p: self.win.present() if self.win else None)
+        self.add_action(show_action)
+
+        # Action to fully quit
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", lambda a, p: self._force_quit())
+        self.add_action(quit_action)
+
+    def _force_quit(self):
+        self.vcam.stop()
+        self._stop_live_view()
+        if self.cam:
+            self.cam.stop()
+        self.quit()
+
     def do_shutdown(self):
+        self.vcam.stop()
         self._stop_live_view()
         if self.cam:
             self.cam.stop()

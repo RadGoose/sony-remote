@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Sony Remote
+Comment=Remote control for Sony cameras with live view and virtual webcam
+Exec=/home/eliasferlander/projects/sony-remote/sony-remote-gui.py
+Icon=camera-photo
+Terminal=false
+Type=Application
+Categories=Photography;Video;
+Keywords=sony;camera;remote;webcam;
+StartupNotify=false

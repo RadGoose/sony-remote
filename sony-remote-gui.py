@@ -10,6 +10,7 @@ import threading
 import os
 import re
 import json
+import signal
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SDK_DIR = os.path.join(APP_DIR, "RemoteCli", "build")
@@ -245,6 +246,13 @@ class SonyRemoteApp(Adw.Application):
         self.vcam = VirtualCamera()
 
     def do_activate(self):
+        # Launch tray helper (separate GTK3 process, lock prevents duplicates)
+        tray_script = os.path.join(APP_DIR, "tray.py")
+        if os.path.exists(tray_script):
+            self._tray_proc = subprocess.Popen(
+                ["python3", tray_script],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         css = Gtk.CssProvider()
         css.load_from_string("""
             .mirrored { transform: scaleX(-1); }
@@ -290,10 +298,14 @@ class SonyRemoteApp(Adw.Application):
 
         self.win.set_content(toolbar)
 
-        # Close button hides window when vcam is active (minimize to background)
+        # Close button minimizes to tray
         self.win.connect("close-request", self._on_close_request)
 
-        self.win.present()
+        if START_MINIMIZED:
+            self.win.show()
+            self.win.set_visible(False)
+        else:
+            self.win.present()
 
         # Show saved cameras, auto-connect if configured, otherwise auto-scan
         auto_name = self._show_saved_cameras()
@@ -686,6 +698,10 @@ class SonyRemoteApp(Adw.Application):
         af_col.append(self.af_mode_dropdown)
         settings_bar.append(af_col)
 
+        # Battery
+        self.lbl_battery = Gtk.Label(label="--", css_classes=["lv-prop"])
+        settings_bar.append(prop_col("BATT", self.lbl_battery))
+
         bottom.append(settings_bar)
 
         # Shutter / record buttons
@@ -1024,11 +1040,13 @@ class SonyRemoteApp(Adw.Application):
         if "LVSTREAM_PROPS " in line:
             try:
                 props = line.strip().split("LVSTREAM_PROPS ", 1)[1]
-                parts = props.split(",", 3)
+                parts = props.split(",", 4)
                 if len(parts) >= 3:
                     self.lbl_aperture.set_label(parts[0].strip())
                     self.lbl_shutter.set_label(parts[1].strip())
                     self.lbl_iso.set_label(parts[2].strip())
+                if len(parts) >= 5:
+                    self._update_battery(parts[4].strip())
             except Exception:
                 pass
 
@@ -1137,6 +1155,38 @@ class SonyRemoteApp(Adw.Application):
         except Exception as e:
             debug(f"[lv] Error: {e}")
 
+    def _update_battery(self, val):
+        try:
+            pct = int(val)
+            if pct < 0:
+                self.lbl_battery.set_label("--")
+                return
+            self.lbl_battery.set_label(f"{pct}%")
+
+            # Low battery warnings
+            if not hasattr(self, '_last_batt_warn'):
+                self._last_batt_warn = 100
+
+            if pct <= 5 and self._last_batt_warn > 5:
+                self._send_battery_notification("Critical", f"Camera battery at {pct}%! Connect charger immediately.")
+                self._last_batt_warn = 5
+            elif pct <= 15 and self._last_batt_warn > 15:
+                self._send_battery_notification("Low", f"Camera battery at {pct}%")
+                self._last_batt_warn = 15
+            elif pct <= 25 and self._last_batt_warn > 25:
+                self._send_battery_notification("Warning", f"Camera battery at {pct}%")
+                self._last_batt_warn = 25
+            elif pct > 30:
+                self._last_batt_warn = 100
+        except (ValueError, TypeError):
+            self.lbl_battery.set_label("--")
+
+    def _send_battery_notification(self, level, body):
+        notif = Gio.Notification.new(f"Sony Remote — Battery {level}")
+        notif.set_body(body)
+        notif.set_priority(Gio.NotificationPriority.URGENT if level == "Critical" else Gio.NotificationPriority.HIGH)
+        self.send_notification("battery-warning", notif)
+
     def _on_vcam_toggled(self, btn):
         if btn.get_active():
             if not self.vcam.start():
@@ -1198,16 +1248,9 @@ class SonyRemoteApp(Adw.Application):
         self._show_saved_cameras()
 
     def _on_close_request(self, window):
-        """If virtual camera is active, hide window instead of quitting."""
-        if self.vcam.is_active:
-            window.set_visible(False)
-            # Send notification so user knows it's still running
-            notif = Gio.Notification.new("Sony Remote")
-            notif.set_body("Virtual camera is still active. Click to reopen.")
-            notif.set_default_action("app.show")
-            self.send_notification("vcam-running", notif)
-            return True  # prevent default close
-        return False  # allow normal close
+        """Always minimize to tray instead of quitting."""
+        window.set_visible(False)
+        return True  # prevent default close
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -1221,11 +1264,17 @@ class SonyRemoteApp(Adw.Application):
         quit_action.connect("activate", lambda a, p: self._force_quit())
         self.add_action(quit_action)
 
+
     def _force_quit(self):
         self.vcam.stop()
         self._stop_live_view()
         if self.cam:
             self.cam.stop()
+        if hasattr(self, '_tray_proc') and self._tray_proc:
+            try:
+                self._tray_proc.kill()
+            except Exception:
+                pass
         self.quit()
 
     def do_shutdown(self):
@@ -1238,6 +1287,9 @@ class SonyRemoteApp(Adw.Application):
 
 if __name__ == "__main__":
     import sys, traceback
+
+    START_MINIMIZED = "--minimized" in sys.argv
+
     def exception_hook(exctype, value, tb):
         debug(f"[CRASH] {''.join(traceback.format_exception(exctype, value, tb))}")
         sys.__excepthook__(exctype, value, tb)

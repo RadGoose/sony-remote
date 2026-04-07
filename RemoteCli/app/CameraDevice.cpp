@@ -613,11 +613,24 @@ void CameraDevice::live_view_stream(int target_fps)
             // Report camera properties every 30 frames
             if (frame_count % 30 == 1) {
                 load_properties();
+
+                // Query battery level
+                CrInt32 battNum = 0;
+                SDK::CrDeviceProperty* battProps = nullptr;
+                CrInt32u battCode = SDK::CrDevicePropertyCode::CrDeviceProperty_BatteryRemain;
+                int battPct = -1;
+                auto battErr = SDK::GetSelectDeviceProperties(m_device_handle, 1, &battCode, &battProps, &battNum);
+                if (CR_SUCCEEDED(battErr) && battNum > 0) {
+                    battPct = (int)battProps[0].GetCurrentValue();
+                    SDK::ReleaseDeviceProperties(m_device_handle, battProps);
+                }
+
                 tout << "LVSTREAM_PROPS "
                      << format_f_number(m_prop.f_number.current) << ","
                      << format_shutter_speed(m_prop.shutter_speed.current) << ","
                      << format_iso_sensitivity(m_prop.iso_sensitivity.current) << ","
-                     << format_focus_mode(m_prop.focus_mode.current)
+                     << format_focus_mode(m_prop.focus_mode.current) << ","
+                     << battPct
                      << "\n";
                 std::flush(tout);
             }

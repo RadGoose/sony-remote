@@ -17,6 +17,38 @@ REMOTECLI = os.path.join(SDK_DIR, "RemoteCli")
 LIVEVIEW_PATH = os.path.join(SDK_DIR, "LiveView000000.JPG")
 LOG_FILE = os.path.join(APP_DIR, "debug.log")
 CREDS_FILE = os.path.join(APP_DIR, "saved_credentials.json")
+CAMERA_IMAGES_DIR = os.path.join(APP_DIR, "camera_images")
+
+# ILCE model code → friendly name
+SONY_MODEL_NAMES = {
+    "ILCE-1M2": "Alpha 1 II",
+    "ILCE-1": "Alpha 1",
+    "ILCE-9M3": "Alpha 9 III",
+    "ILCE-9M2": "Alpha 9 II",
+    "ILCE-9": "Alpha 9",
+    "ILCE-7RM5": "Alpha 7R V",
+    "ILCE-7RM4A": "Alpha 7R IVA",
+    "ILCE-7RM4": "Alpha 7R IV",
+    "ILCE-7RM3": "Alpha 7R III",
+    "ILCE-7CR": "Alpha 7CR",
+    "ILCE-7SM3": "Alpha 7S III",
+    "ILCE-7M5": "Alpha 7 V",
+    "ILCE-7M4": "Alpha 7 IV",
+    "ILCE-7M3": "Alpha 7 III",
+    "ILCE-7CM2": "Alpha 7C II",
+    "ILCE-7C": "Alpha 7C",
+    "ILCE-6700": "Alpha 6700",
+    "ILCE-6600": "Alpha 6600",
+    "ILCE-6400": "Alpha 6400",
+    "ILME-FX6": "FX6",
+    "ILME-FX3": "FX3",
+    "ILME-FX30": "FX30",
+    "MPC-2610": "FR7",
+}
+
+
+def friendly_name(model_id):
+    return SONY_MODEL_NAMES.get(model_id, model_id)
 
 
 def load_saved_creds():
@@ -27,9 +59,14 @@ def load_saved_creds():
         return {}
 
 
-def save_creds(camera_id, user, pw):
+def save_creds(camera_id, user, pw, auto_connect=False, display_name=None):
     data = load_saved_creds()
-    data[camera_id] = {"user": user, "pass": pw}
+    existing = data.get(camera_id, {})
+    data[camera_id] = {
+        "user": user, "pass": pw,
+        "auto_connect": existing.get("auto_connect", auto_connect),
+        "display_name": display_name or existing.get("display_name", ""),
+    }
     with open(CREDS_FILE, "w") as f:
         json.dump(data, f)
 
@@ -125,17 +162,34 @@ class SonyRemoteApp(Adw.Application):
         self._focus_frames = []
         self._tracking_frames = []
         self._face_frames = []
+        self._lv_size_set = False
 
     def do_activate(self):
-        # Load CSS for mirror effect
         css = Gtk.CssProvider()
-        css.load_from_string(".mirrored { -gtk-icon-transform: scaleX(-1); transform: scaleX(-1); }")
+        css.load_from_string("""
+            .mirrored { transform: scaleX(-1); }
+            .lv-hud { background: rgba(0,0,0,0.55); border-radius: 8px; padding: 6px 12px; }
+            .lv-hud-bottom { background: rgba(0,0,0,0.55); border-radius: 8px; padding: 8px 16px; }
+            .lv-prop { color: white; font-size: 15px; font-weight: bold; font-family: monospace; }
+            .lv-prop-dim { color: rgba(255,255,255,0.6); font-size: 11px; }
+            .shutter-circle { border-radius: 9999px; background: white; min-width: 64px; min-height: 64px; }
+            .shutter-circle:hover { background: rgba(255,255,255,0.85); }
+            .rec-circle { border-radius: 9999px; background: rgba(255,255,255,0.15); border: 2px solid white; min-width: 44px; min-height: 44px; }
+            .rec-circle:hover { background: rgba(255,0,0,0.5); }
+            .camera-card { background: alpha(@card_bg_color, 0.8); border-radius: 16px; padding: 20px; min-width: 160px; }
+            .camera-card:hover { background: alpha(@card_bg_color, 1.0); }
+            .camera-card-icon { opacity: 0.6; }
+            .camera-card-name { font-size: 14px; font-weight: bold; }
+            .camera-card-model { font-size: 11px; opacity: 0.5; }
+            .camera-card-new { border: 2px dashed alpha(@borders, 0.4); background: transparent; border-radius: 16px; padding: 20px; min-width: 160px; opacity: 0.6; }
+            .camera-card-new:hover { opacity: 1.0; border-color: @accent_color; }
+        """)
         Gtk.StyleContext.add_provider_for_display(
             self.get_active_window().get_display() if self.get_active_window() else __import__('gi').repository.Gdk.Display.get_default(),
             css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         self.win = Adw.ApplicationWindow(application=self, title="Sony Remote",
-                                         default_width=520, default_height=850)
+                                         default_width=600, default_height=500)
 
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
 
@@ -157,22 +211,138 @@ class SonyRemoteApp(Adw.Application):
         self.win.set_content(toolbar)
         self.win.present()
 
-        # Show saved cameras and auto-scan
-        self._show_saved_cameras()
-        GLib.timeout_add(500, lambda: self.on_scan(None) or False)
+        # Show saved cameras, auto-connect if configured, otherwise auto-scan
+        auto_name = self._show_saved_cameras()
+        if auto_name:
+            GLib.timeout_add(500, lambda: self._connect_saved(auto_name) or False)
+        else:
+            GLib.timeout_add(500, lambda: self.on_scan(None) or False)
 
     def _show_saved_cameras(self):
-        """Show previously saved cameras as 'paired' devices."""
+        """Show saved cameras as cards. Returns name of auto-connect camera if any."""
+        # Clear grid
+        while (child := self.camera_grid.get_first_child()):
+            self.camera_grid.remove(child)
+
         saved = load_saved_creds()
-        for name in saved:
-            row = Adw.ActionRow(title=name, subtitle="Saved", activatable=True)
-            row.add_prefix(Gtk.Image.new_from_icon_name("camera-photo-symbolic"))
-            btn = Gtk.Button(label="Connect", valign=Gtk.Align.CENTER,
-                             css_classes=["suggested-action"])
-            btn.connect("clicked", lambda b, n=name: self._connect_saved(n))
-            row.add_suffix(btn)
-            row.connect("activated", lambda r, n=name: self._connect_saved(n))
-            self.camera_list_box.append(row)
+        auto_connect_name = None
+
+        for cam_id, info in saved.items():
+            is_auto = info.get("auto_connect", False)
+            display = info.get("display_name", "") or friendly_name(cam_id)
+            card = self._make_camera_card(display, cam_id, is_auto, saved=True)
+            self.camera_grid.insert(card, -1)
+            if is_auto:
+                auto_connect_name = cam_id
+
+        return auto_connect_name
+
+    def _make_camera_card(self, display_name, model, is_auto=False, saved=False):
+        btn = Gtk.Button(css_classes=["camera-card"])
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        # Camera image or icon
+        img_path = None
+        for ext in ("png", "webp", "jpg", "jpeg"):
+            p = os.path.join(CAMERA_IMAGES_DIR, f"{model}.{ext}")
+            if os.path.exists(p):
+                img_path = p
+                break
+        if img_path:
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(img_path, 140, 95, True)
+                texture = __import__('gi').repository.Gdk.Texture.new_for_pixbuf(pb)
+                img = Gtk.Picture.new_for_paintable(texture)
+                img.set_can_shrink(False)
+                img.set_halign(Gtk.Align.CENTER)
+                box.append(img)
+            except Exception as e:
+                debug(f"[img] {e}")
+                icon = Gtk.Image.new_from_icon_name("camera-photo-symbolic")
+                icon.set_pixel_size(48)
+                box.append(icon)
+        else:
+            icon = Gtk.Image.new_from_icon_name("camera-photo-symbolic")
+            icon.set_pixel_size(48)
+            icon.add_css_class("camera-card-icon")
+            box.append(icon)
+
+        # Name row with inline edit
+        name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2,
+                           halign=Gtk.Align.CENTER)
+        name_label = Gtk.Label(label=display_name, css_classes=["camera-card-name"],
+                                ellipsize=3)
+        name_row.append(name_label)
+        if saved:
+            rename_btn = Gtk.Button(icon_name="document-edit-symbolic",
+                                     css_classes=["flat", "circular"],
+                                     tooltip_text="Rename")
+            rename_btn.set_size_request(24, 24)
+            rename_btn.connect("clicked", lambda b, n=model: self._rename_camera(n))
+            name_row.append(rename_btn)
+        box.append(name_row)
+
+        # Model subtitle
+        model_label = Gtk.Label(label=friendly_name(model), css_classes=["camera-card-model"])
+        box.append(model_label)
+
+        if saved:
+            # Auto-connect row
+            auto_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                               halign=Gtk.Align.CENTER, margin_top=4)
+            auto_row.append(Gtk.Label(label="Auto-connect", css_classes=["caption", "dim-label"]))
+            auto_sw = Gtk.Switch(valign=Gtk.Align.CENTER, active=is_auto)
+            auto_sw.connect("state-set", lambda sw, state, n=model: self._on_auto_connect_toggled(n, state))
+            auto_row.append(auto_sw)
+            box.append(auto_row)
+
+        btn.set_child(box)
+        if saved:
+            btn.connect("clicked", lambda b, n=model: self._connect_saved(n))
+        else:
+            btn.connect("clicked", lambda b, i=model, n=display_name: self._connect_camera(i, n))
+        return btn
+
+    def _rename_camera(self, camera_id):
+        dialog = Adw.MessageDialog(
+            transient_for=self.win,
+            heading="Rename Camera",
+            body=f"Enter a name for {camera_id}",
+        )
+        entry = Gtk.Entry()
+        saved = load_saved_creds()
+        entry.set_text(saved.get(camera_id, {}).get("display_name", "") or camera_id)
+        entry.set_margin_start(24)
+        entry.set_margin_end(24)
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("save", "Save")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", lambda d, r, e=entry, cid=camera_id: self._on_rename_response(d, r, e, cid))
+        dialog.present()
+
+    def _on_rename_response(self, dialog, response, entry, camera_id):
+        if response == "save":
+            new_name = entry.get_text().strip()
+            if new_name:
+                saved = load_saved_creds()
+                if camera_id in saved:
+                    saved[camera_id]["display_name"] = new_name
+                    with open(CREDS_FILE, "w") as f:
+                        json.dump(saved, f)
+                    self._show_saved_cameras()
+
+    def _on_auto_connect_toggled(self, camera_name, state):
+        saved = load_saved_creds()
+        if camera_name in saved:
+            if state:
+                for name in saved:
+                    saved[name]["auto_connect"] = (name == camera_name)
+            else:
+                saved[camera_name]["auto_connect"] = False
+            with open(CREDS_FILE, "w") as f:
+                json.dump(saved, f)
+        return False
 
     def _connect_saved(self, name):
         """Connect to a saved camera - start process with saved creds."""
@@ -202,52 +372,42 @@ class SonyRemoteApp(Adw.Application):
     # ── Discovery page ──
 
     def _build_discovery_page(self):
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0, vexpand=True)
 
-        status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
-                             margin_top=48, margin_bottom=24, margin_start=24, margin_end=24,
-                             halign=Gtk.Align.CENTER)
+        # Card grid fills the middle
+        scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        grid_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0,
+                           margin_start=24, margin_end=24, margin_top=12)
 
-        icon = Gtk.Image.new_from_icon_name("camera-photo-symbolic")
-        icon.set_pixel_size(64)
-        icon.add_css_class("dim-label")
-        status_box.append(icon)
+        self.camera_grid = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                                        max_children_per_line=3, min_children_per_line=1,
+                                        column_spacing=12, row_spacing=12, homogeneous=True,
+                                        valign=Gtk.Align.START)
+        grid_box.append(self.camera_grid)
+        scroll.set_child(grid_box)
+        page.append(scroll)
 
-        title = Gtk.Label(label="Find your camera")
-        title.add_css_class("title-1")
-        status_box.append(title)
+        # Bottom bar — always anchored
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                         margin_start=24, margin_end=24, margin_top=8, margin_bottom=12,
+                         halign=Gtk.Align.CENTER)
 
-        self.discovery_subtitle = Gtk.Label(
-            label="Make sure your camera is on the same network")
-        self.discovery_subtitle.add_css_class("dim-label")
-        self.discovery_subtitle.set_wrap(True)
-        self.discovery_subtitle.set_justify(Gtk.Justification.CENTER)
-        status_box.append(self.discovery_subtitle)
-
-        page.append(status_box)
-
-        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                           margin_start=24, margin_end=24, margin_top=8, vexpand=True)
-        self.camera_list_box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        self.camera_list_box.add_css_class("boxed-list")
-        list_box.append(self.camera_list_box)
-        page.append(list_box)
-
-        btn_box = Gtk.Box(margin_start=24, margin_end=24, margin_top=16, margin_bottom=24,
-                          halign=Gtk.Align.CENTER, orientation=Gtk.Orientation.VERTICAL, spacing=8)
-
-        self.scan_btn = Gtk.Button(label="Scan for Cameras")
-        self.scan_btn.add_css_class("suggested-action")
-        self.scan_btn.add_css_class("pill")
-        self.scan_btn.set_size_request(220, -1)
-        self.scan_btn.connect("clicked", self.on_scan)
-        btn_box.append(self.scan_btn)
-
-        self.scan_spinner = Gtk.Spinner(halign=Gtk.Align.CENTER)
+        self.scan_spinner = Gtk.Spinner()
         self.scan_spinner.set_visible(False)
-        btn_box.append(self.scan_spinner)
+        bottom.append(self.scan_spinner)
 
-        page.append(btn_box)
+        self.discovery_subtitle = Gtk.Label(label="", css_classes=["dim-label"])
+        bottom.append(self.discovery_subtitle)
+
+        self.scan_btn = Gtk.Button(label="Scan", css_classes=["pill"])
+        self.scan_btn.connect("clicked", self.on_scan)
+        bottom.append(self.scan_btn)
+
+        page.append(bottom)
+
+        # Hidden compat
+        self.camera_list_box = Gtk.ListBox(visible=False)
+
         return page
 
     # ── Login page ──
@@ -344,11 +504,10 @@ class SonyRemoteApp(Adw.Application):
     ]
 
     def _build_controls_page(self):
-        # Full-screen live view with all controls overlaid
         page = Gtk.Overlay()
         page.set_vexpand(True)
 
-        # Live view fills the entire page
+        # Live view fills entire page
         self.lv_picture = Gtk.Picture()
         self.lv_picture.set_content_fit(Gtk.ContentFit.COVER)
         self.lv_picture.add_css_class("mirrored")
@@ -371,112 +530,92 @@ class SonyRemoteApp(Adw.Application):
         self.focus_draw.add_css_class("mirrored")
         page.add_overlay(self.focus_draw)
 
-        # Click to autofocus (on the whole page)
+        # Click to autofocus
         lv_click = Gtk.GestureClick()
         lv_click.connect("released", self._on_lv_click)
         page.add_controller(lv_click)
 
-        # ── Top bar overlay ──
-        top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
-                          margin_start=12, margin_end=12, margin_top=8,
-                          halign=Gtk.Align.FILL, valign=Gtk.Align.START)
-        top_bar.add_css_class("osd")
-
-        self.connected_label = Gtk.Label(label="", css_classes=["caption"], hexpand=True, xalign=0)
-        top_bar.append(self.connected_label)
+        # ── Top right: small HUD buttons ──
+        top_right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4,
+                            margin_end=12, margin_top=8,
+                            halign=Gtk.Align.END, valign=Gtk.Align.START)
+        top_right.add_css_class("lv-hud")
 
         self.overlay_toggle = Gtk.ToggleButton(icon_name="view-reveal-symbolic",
                                                 active=True, tooltip_text="Show focus overlay",
                                                 css_classes=["flat", "circular"])
         self.overlay_toggle.connect("toggled", lambda b: self.focus_draw.queue_draw())
-        top_bar.append(self.overlay_toggle)
+        top_right.append(self.overlay_toggle)
 
         disconnect_btn = Gtk.Button(icon_name="process-stop-symbolic",
                                      tooltip_text="Disconnect",
-                                     css_classes=["flat", "circular"])
+                                     css_classes=["flat", "circular", "destructive-action"])
         disconnect_btn.connect("clicked", self.on_disconnect)
-        top_bar.append(disconnect_btn)
+        top_right.append(disconnect_btn)
 
-        page.add_overlay(top_bar)
+        page.add_overlay(top_right)
 
-        # ── Bottom bar overlay - camera settings + controls ──
-        bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
-                             margin_start=12, margin_end=12, margin_bottom=12,
-                             halign=Gtk.Align.FILL, valign=Gtk.Align.END)
+        # ── Bottom overlay ──
+        bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                         margin_start=16, margin_end=16, margin_bottom=16,
+                         halign=Gtk.Align.FILL, valign=Gtk.Align.END)
 
-        # Settings row (shutter speed, aperture, ISO)
-        settings_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0,
-                               halign=Gtk.Align.FILL)
-        settings_row.add_css_class("osd")
+        # Settings bar: shutter | aperture | ISO | AF mode
+        settings_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24,
+                               halign=Gtk.Align.CENTER)
+        settings_bar.add_css_class("lv-hud-bottom")
 
-        self.lbl_shutter = Gtk.Label(label="1/--", css_classes=["heading"],
-                                      hexpand=True, xalign=0.5)
-        self.lbl_aperture = Gtk.Label(label="F --", css_classes=["heading"],
-                                       hexpand=True, xalign=0.5)
-        self.lbl_iso = Gtk.Label(label="ISO --", css_classes=["heading"],
-                                  hexpand=True, xalign=0.5)
+        self.lbl_shutter = Gtk.Label(label="--", css_classes=["lv-prop"])
+        self.lbl_aperture = Gtk.Label(label="--", css_classes=["lv-prop"])
+        self.lbl_iso = Gtk.Label(label="--", css_classes=["lv-prop"])
 
-        settings_row.append(self.lbl_shutter)
-        settings_row.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        settings_row.append(self.lbl_aperture)
-        settings_row.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        settings_row.append(self.lbl_iso)
+        def prop_col(label_text, value_widget):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, halign=Gtk.Align.CENTER)
+            col.append(Gtk.Label(label=label_text, css_classes=["lv-prop-dim"]))
+            col.append(value_widget)
+            return col
 
-        bottom_box.append(settings_row)
+        settings_bar.append(prop_col("SHUTTER", self.lbl_shutter))
+        settings_bar.append(prop_col("APERTURE", self.lbl_aperture))
+        settings_bar.append(prop_col("ISO", self.lbl_iso))
 
-        # AF mode row
-        af_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
-                         halign=Gtk.Align.FILL)
-        af_row.add_css_class("osd")
-
+        # AF mode dropdown inline
+        af_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, halign=Gtk.Align.CENTER)
+        af_col.append(Gtk.Label(label="FOCUS", css_classes=["lv-prop-dim"]))
         self.af_mode_dropdown = Gtk.DropDown.new_from_strings(
             [m[0] for m in self.AF_MODES])
         self.af_mode_dropdown.set_selected(1)
         self.af_mode_dropdown.connect("notify::selected", self._on_af_mode_changed)
-        af_row.append(self.af_mode_dropdown)
+        af_col.append(self.af_mode_dropdown)
+        settings_bar.append(af_col)
 
-        self.lbl_af_mode = Gtk.Label(label="", css_classes=["dim-label", "caption"],
-                                      hexpand=True, xalign=1)
-        af_row.append(self.lbl_af_mode)
+        bottom.append(settings_bar)
 
-        bottom_box.append(af_row)
-
-        # Controls row (shutter + record)
-        controls_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16,
+        # Shutter / record buttons
+        controls_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20,
                                halign=Gtk.Align.CENTER, margin_top=4)
 
-        # Record button
-        self.rec_btn = Gtk.Button(css_classes=["circular", "osd"])
+        self.rec_btn = Gtk.Button(css_classes=["rec-circle"], tooltip_text="Record")
         rec_icon = Gtk.Image.new_from_icon_name("media-record-symbolic")
-        rec_icon.set_pixel_size(24)
+        rec_icon.set_pixel_size(20)
         self.rec_btn.set_child(rec_icon)
-        self.rec_btn.set_size_request(48, 48)
         self.rec_btn.connect("clicked", lambda b: self._action(["1", "6"]))
         controls_row.append(self.rec_btn)
 
-        # Shutter button (big, center)
-        self.shutter_btn = Gtk.Button(css_classes=["circular", "suggested-action"])
+        self.shutter_btn = Gtk.Button(css_classes=["shutter-circle"], tooltip_text="Take Photo")
         shutter_icon = Gtk.Image.new_from_icon_name("camera-photo-symbolic")
-        shutter_icon.set_pixel_size(32)
+        shutter_icon.set_pixel_size(28)
         self.shutter_btn.set_child(shutter_icon)
-        self.shutter_btn.set_size_request(64, 64)
         self.shutter_btn.connect("clicked", self._on_shutter_clicked)
         controls_row.append(self.shutter_btn)
 
-        # AF+Shoot button
-        af_shoot_btn = Gtk.Button(css_classes=["circular", "osd"])
-        af_shoot_icon = Gtk.Image.new_from_icon_name("focus-top-bar-symbolic")
-        af_shoot_icon.set_pixel_size(24)
-        af_shoot_btn.set_child(af_shoot_icon)
-        af_shoot_btn.set_size_request(48, 48)
-        af_shoot_btn.connect("clicked", lambda b: self._action(["1", "3"]))
-        controls_row.append(af_shoot_btn)
+        bottom.append(controls_row)
+        page.add_overlay(bottom)
 
-        bottom_box.append(controls_row)
-        page.add_overlay(bottom_box)
-
-        # Hidden status label
-        self.connected_status = Gtk.Label(label="Connected", visible=False)
+        # Hidden labels for compat
+        self.connected_label = Gtk.Label(visible=False)
+        self.connected_status = Gtk.Label(visible=False)
+        self.lbl_af_mode = Gtk.Label(visible=False)
 
         return page
 
@@ -489,9 +628,6 @@ class SonyRemoteApp(Adw.Application):
             self.cam.stop()
             self.cam = None
 
-        # Clear list and re-show saved cameras
-        while (child := self.camera_list_box.get_first_child()):
-            self.camera_list_box.remove(child)
         self.cameras = []
         self._show_saved_cameras()
 
@@ -517,14 +653,8 @@ class SonyRemoteApp(Adw.Application):
             if model in saved:
                 return
 
-            row = Adw.ActionRow(title=model, subtitle=addr, activatable=True)
-            row.add_prefix(Gtk.Image.new_from_icon_name("camera-photo-symbolic"))
-            btn = Gtk.Button(label="Connect", valign=Gtk.Align.CENTER,
-                             css_classes=["suggested-action"])
-            btn.connect("clicked", lambda b, i=idx, n=model: self._connect_camera(i, n))
-            row.add_suffix(btn)
-            row.connect("activated", lambda r, i=idx, n=model: self._connect_camera(i, n))
-            self.camera_list_box.append(row)
+            card = self._make_camera_card(friendly_name(model), idx, saved=False)
+            self.camera_grid.insert(card, -1)
 
         if "Connect to camera with input number" in line:
             self._scan_done()
@@ -535,15 +665,14 @@ class SonyRemoteApp(Adw.Application):
 
     def _scan_done(self, failed=False):
         self.scan_btn.set_sensitive(True)
-        self.scan_btn.set_label("Scan Again")
+        self.scan_btn.set_label("Scan")
         self.scan_spinner.set_spinning(False)
         self.scan_spinner.set_visible(False)
         if failed or not self.cameras:
-            self.discovery_subtitle.set_label(
-                "No cameras found. Check your network and try again.")
+            self.discovery_subtitle.set_label("No new cameras found")
         else:
             n = len(self.cameras)
-            self.discovery_subtitle.set_label(f"Found {n} camera{'s' if n != 1 else ''}")
+            self.discovery_subtitle.set_label(f"{n} found")
 
     # ── Connect ──
 
@@ -646,8 +775,7 @@ class SonyRemoteApp(Adw.Application):
             self.busy = False
             self._in_submenu = False
             self.connected_label.set_label(self.connected_name)
-            self.header.set_title_widget(
-                Adw.WindowTitle(title=self.connected_name, subtitle="Connected"))
+            self.header.set_visible(False)
             self.stack.set_visible_child_name("controls")
             self._start_live_view()
 
@@ -803,9 +931,7 @@ class SonyRemoteApp(Adw.Application):
                 if len(parts) >= 3:
                     self.lbl_aperture.set_label(parts[0].strip())
                     self.lbl_shutter.set_label(parts[1].strip())
-                    self.lbl_iso.set_label(f"ISO {parts[2].strip()}")
-                if len(parts) >= 4:
-                    self.lbl_af_mode.set_label(parts[3].strip())
+                    self.lbl_iso.set_label(parts[2].strip())
             except Exception:
                 pass
 
@@ -894,6 +1020,20 @@ class SonyRemoteApp(Adw.Application):
     def _update_liveview_image(self):
         try:
             if os.path.exists(LIVEVIEW_PATH) and os.path.getsize(LIVEVIEW_PATH) > 100:
+                # Resize window to match image aspect ratio on first frame
+                if not self._lv_size_set:
+                    try:
+                        pb = GdkPixbuf.Pixbuf.new_from_file(LIVEVIEW_PATH)
+                        iw, ih = pb.get_width(), pb.get_height()
+                        if iw > 0 and ih > 0:
+                            aspect = iw / ih
+                            # Target ~900px wide, scale height to match
+                            new_w = 900
+                            new_h = int(new_w / aspect)
+                            self.win.set_default_size(new_w, new_h)
+                            self._lv_size_set = True
+                    except Exception:
+                        pass
                 self.lv_picture.set_filename(None)
                 self.lv_picture.set_filename(LIVEVIEW_PATH)
                 self.lv_placeholder.set_visible(False)
@@ -932,23 +1072,23 @@ class SonyRemoteApp(Adw.Application):
 
     def _go_to_discovery(self, message=None):
         self._stop_live_view()
+        self.header.set_visible(True)
         self.stack.set_visible_child_name("discovery")
         self.header.set_title_widget(Adw.WindowTitle(title="Sony Remote", subtitle=""))
         self.scan_btn.set_sensitive(True)
-        self.scan_btn.set_label("Scan for Cameras")
+        self.scan_btn.set_label("Scan")
         self.scan_spinner.set_spinning(False)
         self.scan_spinner.set_visible(False)
         self.lv_placeholder.set_visible(True)
         self.lv_picture.set_filename(None)
         self._focus_frames = []
+        self._tracking_frames = []
+        self._face_frames = []
+        self._lv_size_set = False
         if message:
             self.discovery_subtitle.set_label(message)
         else:
-            self.discovery_subtitle.set_label(
-                "Make sure your camera is on the same network")
-        # Clear list and re-show saved cameras
-        while (child := self.camera_list_box.get_first_child()):
-            self.camera_list_box.remove(child)
+            self.discovery_subtitle.set_label("")
         self.cameras = []
         self._show_saved_cameras()
 

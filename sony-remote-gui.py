@@ -246,6 +246,12 @@ class SonyRemoteApp(Adw.Application):
         self.vcam = VirtualCamera()
 
     def do_activate(self):
+        # If window already exists, just show it
+        if hasattr(self, 'win') and self.win:
+            self.win.set_visible(True)
+            self.win.present()
+            return
+
         # Launch tray helper (separate GTK3 process, lock prevents duplicates)
         tray_script = os.path.join(APP_DIR, "tray.py")
         if os.path.exists(tray_script):

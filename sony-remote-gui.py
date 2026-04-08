@@ -114,41 +114,52 @@ class VirtualCamera:
         debug("[vcam] Stopped")
 
     def _feed_loop(self):
-        """Feed live view to v4l2loopback via long-running ffmpeg with image updates."""
+        """Feed live view JPEG frames to v4l2loopback via ffmpeg."""
         import time
-        import shutil
-
-        # Create a staging file to avoid reading partial writes
-        stage_path = LIVEVIEW_PATH + ".vcam"
 
         while self._active:
             if not os.path.exists(LIVEVIEW_PATH) or os.path.getsize(LIVEVIEW_PATH) < 100:
                 time.sleep(0.1)
                 continue
 
-            debug("[vcam] Starting ffmpeg (long-running)")
-            # Use -re for real-time, -loop 1 to keep re-reading the file
-            # -f image2 -loop 1 continuously re-reads the same file
+            debug("[vcam] Starting ffmpeg MJPEG pipe")
             try:
                 self.proc = subprocess.Popen([
                     "ffmpeg", "-y",
-                    "-re",
-                    "-loop", "1",
-                    "-f", "image2",
+                    "-f", "image2pipe",
                     "-framerate", "30",
-                    "-i", LIVEVIEW_PATH,
-                    "-pix_fmt", "yuyv422",
+                    "-i", "pipe:0",
+                    "-pix_fmt", "bgr0",
                     "-f", "v4l2",
                     VCAM_DEVICE,
-                ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-                # Keep running until stopped or process dies
-                while self._active and self.proc.poll() is None:
-                    time.sleep(0.5)
-
+                ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception as e:
-                debug(f"[vcam] Error: {e}")
+                debug(f"[vcam] Failed to start ffmpeg: {e}")
                 time.sleep(1)
+                continue
+
+            last_mtime = 0
+            while self._active and self.proc.poll() is None:
+                try:
+                    if not os.path.exists(LIVEVIEW_PATH):
+                        time.sleep(0.05)
+                        continue
+                    mtime = os.path.getmtime(LIVEVIEW_PATH)
+                    if mtime == last_mtime:
+                        time.sleep(0.01)
+                        continue
+                    last_mtime = mtime
+
+                    with open(LIVEVIEW_PATH, "rb") as f:
+                        jpeg_data = f.read()
+                    if len(jpeg_data) > 100:
+                        self.proc.stdin.write(jpeg_data)
+                        self.proc.stdin.flush()
+                except BrokenPipeError:
+                    break
+                except Exception as e:
+                    debug(f"[vcam] Frame error: {e}")
+                    time.sleep(0.1)
 
             if self.proc:
                 try:
